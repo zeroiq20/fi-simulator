@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When am I financially independent?</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px;
+         margin: 2rem auto; padding: 0 1rem; color: #222; line-height: 1.5; }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  p.sub { color: #555; margin-top: 0; }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+         gap: 0.75rem 1rem; margin: 1.5rem 0; }
+  label { font-size: 0.85rem; color: #444; display: block; margin-bottom: 0.2rem; }
+  input { width: 100%; padding: 0.45rem; font-size: 1rem; box-sizing: border-box; }
+  button { grid-column: 1 / -1; padding: 0.7rem; font-size: 1.05rem;
+           background: #1a6f4b; color: #fff; border: none; cursor: pointer; }
+  button:disabled { background: #888; }
+  #verdict { background: #f2f7f4; border-left: 4px solid #1a6f4b;
+             padding: 1rem; margin: 1.5rem 0; display: none; }
+  #verdict p { margin: 0.3rem 0; }
+  #legend { font-size: 0.85rem; color: #444; margin: 0.5rem 0 1.5rem; }
+  #legend span { display: inline-block; margin-right: 1rem; }
+  .sw { display: inline-block; width: 22px; height: 3px; vertical-align: middle;
+        margin-right: 4px; }
+  small { color: #666; }
+  canvas { width: 100%; height: 420px; display: block; }
+</style>
+</head>
+<body>
+<h1>When am I financially independent?</h1>
+<p class="sub">Not one date — a distribution. This runs thousands of simulated futures
+entirely in your browser (nothing is sent to a server) and shows how many of
+them reach your FI target, and by when. Educational purposes only, not
+financial advice.</p>
+
+<form id="form">
+  <div><label for="start">Starting wealth ($)</label>
+    <input id="start" type="number" value="1000000" min="0" step="1000"></div>
+  <div><label for="contrib">Annual contribution, year 1 ($)</label>
+    <input id="contrib" type="number" value="100000" min="0" step="1000"></div>
+  <div><label for="target">FI target ($)</label>
+    <input id="target" type="number" value="2500000" min="0" step="10000"></div>
+  <div><label for="mean">Expected annual return</label>
+    <input id="mean" type="number" value="0.07" step="0.01"></div>
+  <div><label for="sd">Annual volatility (SD)</label>
+    <input id="sd" type="number" value="0.15" step="0.01" min="0"></div>
+  <div><label for="sims">Simulations</label>
+    <input id="sims" type="number" value="10000" min="100" max="200000" step="1000"></div>
+  <div><label for="seed">Seed (blank = random run)</label>
+    <input id="seed" type="number" placeholder="e.g. 7"></div>
+  <button id="run" type="submit">Run simulation</button>
+</form>
+
+<div id="verdict"></div>
+<canvas id="chart" width="900" height="420"></canvas>
+<div id="legend">
+  <span><span class="sw" style="background:#1a6f4b"></span>Median wealth</span>
+  <span><span class="sw" style="background:#b9d2c3"></span>Worst-to-best tenth band</span>
+  <span><span class="sw" style="background:#999"></span>Steady 5% path (what a spreadsheet would say)</span>
+  <span><span class="sw" style="background:#b3261e"></span>FI target</span>
+</div>
+<p><small>How it works: each year, wealth grows by a random return drawn from a
+Normal distribution (your mean and volatility), plus that year's contribution
+(contributions grow 3% a year, matching the example series). FI year = the
+first year wealth reaches your target. Percentiles use the same method as
+Excel's PERCENTILE.INC. Same seed = same result in this page. Note: seeds here
+are not comparable to the R engine version — the two use different random
+number generators — but the distributions match.</small></p>
+
+<script>
+// ENGINE-START — pure simulation, no DOM. Also used by the node validation test.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Box-Muller normal draws from a uniform source; caches the spare draw.
+function makeNormal(uniform) {
+  let spare = null;
+  return function (mean, sd) {
+    if (spare !== null) { const v = spare; spare = null; return mean + sd * v; }
+    let u1 = 0;
+    while (u1 === 0) u1 = uniform(); // avoid log(0)
+    const u2 = uniform();
+    const r = Math.sqrt(-2 * Math.log(u1));
+    const theta = 2 * Math.PI * u2;
+    spare = r * Math.sin(theta);
+    return mean + sd * (r * Math.cos(theta));
+  };
+}
+
+// Quantile matching R quantile(type = 7) == Excel PERCENTILE.INC.
+function quantileType7(sorted, p) {
+  const n = sorted.length;
+  const h = (n - 1) * p;
+  const lo = Math.floor(h), hi = Math.ceil(h);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+}
+
+function medianOf(arr) {
+  const s = arr.slice().sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Mirrors the R engine: 30 years (2026-2055), W[t] = W[t-1]*(1+r) + income[t].
+function runSimulation(opts) {
+  const years = [];
+  for (let y = 2026; y <= 2055; y++) years.push(y);
+  const income = years.map((_, t) => Math.round(opts.contribution * Math.pow(1.03, t) * 100) / 100);
+  const seed = (opts.seed === null || opts.seed === undefined || opts.seed === "")
+    ? Math.floor(Math.random() * 4294967296)
+    : (opts.seed >>> 0);
+  const randn = makeNormal(mulberry32(seed));
+  const n = opts.nSims, T = years.length;
+  const wealth = []; // wealth[s][t]
+  const fiIdx = [];  // 0-based year index of FI hit, or -1
+  for (let s = 0; s < n; s++) {
+    let prev = opts.startAssets;
+    const row = new Array(T);
+    let hit = -1;
+    for (let t = 0; t < T; t++) {
+      prev = prev * (1 + randn(opts.retMean, opts.retSd)) + income[t];
+      row[t] = prev;
+      if (hit < 0 && prev >= opts.fiTarget) hit = t;
+    }
+    wealth.push(row);
+    fiIdx.push(hit);
+  }
+  const results = years.map((year, t) => {
+    const col = wealth.map((row) => row[t]).sort((a, b) => a - b);
+    const pFi = fiIdx.filter((h) => h >= 0 && h <= t).length / n;
+    return { year, pFi,
+      p10: quantileType7(col, 0.1),
+      p50: quantileType7(col, 0.5),
+      p90: quantileType7(col, 0.9) };
+  });
+  // Deterministic path at a fixed rate (same recursion, no randomness).
+  function detPath(rate) {
+    let prev = opts.startAssets;
+    return income.map((inc) => { prev = prev * (1 + rate) + inc; return prev; });
+  }
+  const detMid = detPath(0.05);
+  const hits = fiIdx.filter((h) => h >= 0);
+  const verdict = {
+    medianFiYear: hits.length ? 2026 + medianOf(hits) : null,
+    pFi10y: fiIdx.filter((h) => h >= 0 && h <= 10).length / n,
+    pFi20y: fiIdx.filter((h) => h >= 0 && h <= 20).length / n,
+    pFi30y: hits.length / n,
+    medianWealth30: results[T - 1].p50,
+    p10Wealth30: results[T - 1].p10,
+  };
+  return { results, verdict, detMid };
+}
+// ENGINE-END
+
+// ---- page wiring ----
+const $ = (id) => document.getElementById(id);
+const fmt$ = (n) => "$" + Math.round(n).toLocaleString();
+const fmtYear = (y) => Number.isInteger(y) ? String(y) : y.toFixed(1);
+let lastDraw = null;
+
+function plainLanguage(results, v) {
+  const firstAt = (t) => {
+    const row = results.find((r) => r.pFi >= t);
+    return row ? row.year : null;
+  };
+  const y50 = firstAt(0.5), y90 = firstAt(0.9);
+  const lines = [];
+  if (v.medianFiYear !== null)
+    lines.push(`<p><strong>Median future: FI in ${fmtYear(v.medianFiYear)}.</strong> Half of all simulated futures do better, half do worse.</p>`);
+  else
+    lines.push(`<p><strong>No simulated future reached FI within 30 years.</strong> Try a lower target, higher contribution, or higher return assumption.</p>`);
+  if (y90) lines.push(`<p>In <strong>9 out of 10</strong> simulated futures, you reach FI by <strong>${y90}</strong>. In 1 out of 10, it's later.</p>`);
+  if (y50) lines.push(`<p>In <strong>5 out of 10</strong> futures, you're FI by <strong>${y50}</strong>.</p>`);
+  lines.push(`<p>Wealth in the final year ranges from ${fmt$(v.p10Wealth30)} (worst tenth) to a median of ${fmt$(v.medianWealth30)}. The width of that band is the point — a single FI date hides it.</p>`);
+  return lines.join("");
+}
+
+function drawChart(results, detMid, target) {
+  const canvas = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = 420;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  const padL = 62, padR = 14, padT = 12, padB = 30;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  let maxV = target;
+  results.forEach((r) => { maxV = Math.max(maxV, r.p90); });
+  maxV *= 1.05;
+  const X = (i) => padL + (i / (results.length - 1)) * plotW;
+  const Y = (v) => padT + plotH - (v / maxV) * plotH;
+  // Gridlines + y labels ($M).
+  ctx.font = "12px system-ui, sans-serif"; ctx.fillStyle = "#666";
+  ctx.strokeStyle = "#eee"; ctx.lineWidth = 1;
+  const step = niceStep(maxV / 5);
+  for (let v = 0; v <= maxV; v += step) {
+    ctx.beginPath(); ctx.moveTo(padL, Y(v)); ctx.lineTo(w - padR, Y(v)); ctx.stroke();
+    ctx.fillText("$" + (v / 1e6).toFixed(v >= 1e6 ? 0 : 1) + "M", 4, Y(v) + 4);
+  }
+  // X labels every 5 years.
+  ctx.fillStyle = "#666";
+  results.forEach((r, i) => {
+    if ((r.year - 2026) % 5 === 0) ctx.fillText(String(r.year), X(i) - 12, h - 8);
+  });
+  // P10-P90 band.
+  ctx.fillStyle = "rgba(185, 210, 195, 0.55)";
+  ctx.beginPath();
+  results.forEach((r, i) => { const x = X(i), y = Y(r.p90); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  for (let i = results.length - 1; i >= 0; i--) ctx.lineTo(X(i), Y(results[i].p10));
+  ctx.closePath(); ctx.fill();
+  // Median line.
+  drawLine(ctx, results, (r) => r.p50, X, Y, "#1a6f4b", 2.5, []);
+  // Steady 5% path, dashed gray.
+  ctx.beginPath();
+  detMid.forEach((v, i) => { const x = X(i), y = Y(v); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.strokeStyle = "#999"; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]); ctx.stroke(); ctx.setLineDash([]);
+  // FI target, dashed red.
+  drawLine(ctx, results, () => target, X, Y, "#b3261e", 1.5, [6, 4]);
+  function drawLine(ctx, rows, get, X, Y, color, width, dash) {
+    ctx.beginPath();
+    rows.forEach((r, i) => { const x = X(i), y = Y(get(r)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.stroke(); ctx.setLineDash([]);
+  }
+  function niceStep(raw) {
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    return (norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10) * mag;
+  }
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const btn = $("run");
+  btn.disabled = true; btn.textContent = "Running…";
+  // Let the button repaint before the (fast, but blocking) simulation.
+  setTimeout(() => {
+    const opts = {
+      startAssets: parseFloat($("start").value) || 0,
+      contribution: parseFloat($("contrib").value) || 0,
+      fiTarget: parseFloat($("target").value) || 0,
+      retMean: parseFloat($("mean").value) || 0,
+      retSd: Math.max(0, parseFloat($("sd").value) || 0),
+      nSims: Math.min(200000, Math.max(100, parseInt($("sims").value, 10) || 10000)),
+      seed: $("seed").value === "" ? null : parseInt($("seed").value, 10),
+    };
+    const { results, verdict, detMid } = runSimulation(opts);
+    $("verdict").innerHTML = plainLanguage(results, verdict);
+    $("verdict").style.display = "block";
+    lastDraw = { results, detMid, target: opts.fiTarget };
+    drawChart(results, detMid, opts.fiTarget);
+    btn.disabled = false; btn.textContent = "Run simulation";
+  }, 30);
+});
+
+window.addEventListener("resize", () => {
+  if (lastDraw) drawChart(lastDraw.results, lastDraw.detMid, lastDraw.target);
+});
+</script>
+</body>
+</html>
